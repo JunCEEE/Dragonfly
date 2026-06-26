@@ -15,6 +15,7 @@ from __future__ import print_function
 import sys
 import os
 import logging
+import warnings
 import numpy as np
 import h5py
 try:
@@ -28,7 +29,7 @@ from py_src import read_config # pylint: disable=wrong-import-position
 from py_src import detector # pylint: disable=wrong-import-position
 try:
     # from cfelpyutils import crystfel_utils, geometry_utils
-    from cfelpyutils.geometry import crystfel_utils, geometry
+    from cfelpyutils.geometry import crystfel_utils
 except ImportError:
     print('Need cfelpyutils package to safely parse geometry file.')
     print('Install from pip if possible.')
@@ -80,8 +81,12 @@ def main():
                         help='Polarization direction: x, y, or none (default: x)')
     parser.add_argument('--stoprad', type=float, default=0.,
                         help='Stop radius in pixels (default: 0)')
+    parser.add_argument('--centerrad', type=float, default=None,
+                        help='Only include pixels within this radius (pixels) from the beam centre')
     parser.add_argument('--output_folder', default='.',
                         help='Output folder for detector file (default: current directory)')
+    parser.add_argument('--output', default=None,
+                        help='Output filename (overrides --output_folder; default: <geom_basename>.h5)')
     args = parser.special_parse_args()
 
     logging.info('Starting cheetahtodet...')
@@ -130,7 +135,6 @@ def main():
     pm.setdefault('dets_x', 1)
     pm.setdefault('dets_y', 1)
 
-    import warnings
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
         q_pm = read_config.compute_q_params(pm['detd'], pm['dets_x'], pm['dets_y'],
@@ -140,7 +144,7 @@ def main():
     x, y = _compute_pix_maps_stacked(geom.detector)
     z = pm['detd'] / pm['pixsize']
     pm['pixsize'] = 1.
-    
+
     det = detector.Detector()
     norm = np.sqrt(x*x + y*y + z*z)
     qscaling = 1. / pm['wavelength'] / q_pm['q_sep']
@@ -162,12 +166,18 @@ def main():
 
     det.detd = pm['detd'] / pm['pixsize']
     det.ewald_rad = pm['ewald_rad']
-    det_file = output_folder + '/' + os.path.splitext(os.path.basename(args.geom_fname))[0]
-    try:
-        import h5py
-        det_file += '.h5'
-    except ImportError:
-        det_file += '.dat'
+    if args.centerrad is not None:
+        radius = np.sqrt(x*x + y*y)
+        sel = radius <= args.centerrad
+        det.qx = det.qx[sel]
+        det.qy = det.qy[sel]
+        det.qz = det.qz[sel]
+        det.corr = det.corr[sel]
+        det.raw_mask = det.raw_mask[sel]
+    if args.output is not None:
+        det_file = args.output
+    else:
+        det_file = output_folder + '/' + os.path.splitext(os.path.basename(args.geom_fname))[0] + '.h5'
     logging.info('Writing detector file to %s', det_file)
     sys.stderr.write('Writing detector file to %s\n'%det_file)
     det.write(det_file)
