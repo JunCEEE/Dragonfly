@@ -8,10 +8,10 @@ modules are stacked in module order (0-15), giving 16 * 512 * 128 = 1,048,576
 pixels per frame.
 
 Usage:
-    python cxi_to_emc.py <run_dir> <output.emc> --hits-only [options]
+    python cxi_to_emc.py <proposal> <run> <output.emc> --hits-only [options]
 
-    <run_dir>   Path to proc run directory, e.g.
-                /gpfs/exfel/exp/SPB/202601/p010572/proc/r0020
+    <proposal>  EuXFEL proposal number, e.g. 10572
+    <run>       Run number, e.g. 20
     <output>    Output EMC or HDF5 file (.emc or .h5)
 '''
 
@@ -23,7 +23,8 @@ import time
 import numpy as np
 import h5py
 from concurrent.futures import ThreadPoolExecutor
-from extra_data import RunDirectory, by_id
+# from extra_data import RunDirectory, by_id
+from extra_data import open_run, by_id
 from extra_data.components import AGIPD1M
 try:
     from cfelpyutils.geometry import crystfel_utils
@@ -41,6 +42,9 @@ MODULE_FAST = 128
 NUM_PIX = NUM_MODULES * MODULE_SLOW * MODULE_FAST  # 1,048,576
 
 HITFINDER_SRC = 'SPB_DET_AGIPD1M-1/REDU/SPI_HITFINDER:output'
+BUNCHPATTERN_SRC = 'SPB_RR_SYS/MDL/BUNCH_PATTERN'
+# BUNCHPATTERN_PULSEID_KEY = 'sase1.pulseIds.value'
+BUNCHPATTERN_PULSEID_KEY = 'laser.pulseIds'
 
 
 def compute_pix_maps(geom_file):
@@ -72,15 +76,17 @@ def compute_pix_maps(geom_file):
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Convert AGIPD1M hit frames from a CXI file to EMC format')
-    parser.add_argument('run_dir',
-                        help='Path to proc run directory')
+    parser.add_argument('proposal', type=int,
+                        help='EuXFEL proposal number, e.g. 10572')
+    parser.add_argument('run', type=int,
+                        help='Run number, e.g. 20')
     parser.add_argument('output',
                         help='Output file (.emc for binary, .h5 for HDF5)')
     parser.add_argument('--hits-only', action='store_true', default=False,
                         help='Write only frames flagged as hits by SPI_HITFINDER')
     parser.add_argument('--cxi', default=None,
                         help='Path to pre-processed CXI file (used with --hits-only). '
-                             'Defaults to <exp_base>/usr/Shared/cxi/<run>.cxi deduced from run_dir.')
+                             'Defaults to <exp_base>/usr/Shared/cxi/<run>.cxi deduced from run files.')
     parser.add_argument('--pulses', default=None,
                         help='Pulse slice to select, e.g. "0:100" or "::2". '
                              'Default: all pulses')
@@ -96,6 +102,11 @@ def parse_args():
                         help='Number of trains to load into memory at once (default: 500)')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of threads for parallel sparsification (default: 4)')
+    parser.add_argument('--ndark', type=int, default=2,
+                        help='Dark pulses between pumped pulses in the bunch pattern (default: 2)')
+    parser.add_argument('--pulse-offset', type=int, default=4,
+                        help='Pulse ID offset applied to hit pulse IDs before matching '
+                             'against BUNCHPATTERN laser pulse IDs (default: 4)')
     parser.add_argument('-v', '--verbose', action='store_true', default=False)
     return parser.parse_args()
 
@@ -143,6 +154,36 @@ def load_hit_indices(run, train_sel):
         logging.warning('data.hitscore not available in hitfinder source')
         hit_scores = None
     return hit_train_ids, hit_pulse_ids, total_pulses, total_hit_pulses, hit_scores
+
+
+def compute_pump_flags(run, hit_train_ids, hit_pulse_ids, ndark, pulse_offset=4):
+    """Return uint8 array (1=pumped, 0=dark) for each hit, or None if unavailable."""
+    try:
+        selected = run.select(BUNCHPATTERN_SRC).select_trains(by_id(hit_train_ids))
+        bunch_pulse = selected.get_array(BUNCHPATTERN_SRC, BUNCHPATTERN_PULSEID_KEY)
+        bp_train_ids = bunch_pulse.coords['trainId'].values
+        bp_values = bunch_pulse.values  # shape (n_trains, max_pulses), zeros = unused
+    except Exception:
+        logging.warning('BUNCHPATTERN source not available; skipping pump flags')
+        return None
+
+    # Build per-train set of laser pulse IDs (nonzero entries)
+    corrected_pids = hit_pulse_ids - pulse_offset
+    laser_pulses = {}
+    for i, tid in enumerate(bp_train_ids):
+        nonzero = bp_values[i][bp_values[i] > 0]
+        if len(nonzero):
+            laser_pulses[int(tid)] = set(nonzero.astype(int))
+
+    flags = np.zeros(len(hit_train_ids), dtype=np.uint8)
+    for k, (tid, pid) in enumerate(zip(hit_train_ids, corrected_pids)):
+        pids = laser_pulses.get(int(tid))
+        if pids is not None and int(pid) in pids:
+            flags[k] = 1
+
+    n_pumped = int(flags.sum())
+    logging.info('Pump flags: %d/%d hits pumped', n_pumped, len(flags))
+    return flags
 
 
 def _sparsify(f):
@@ -200,13 +241,11 @@ def main():
         format='%(asctime)s %(levelname)s %(message)s')
     t_start = time.time()
 
-    if not os.path.isdir(args.run_dir):
-        logging.error('Run directory not found: %s', args.run_dir)
-        sys.exit(1)
-
-    logging.info('Opening run: %s', args.run_dir)
-    run = RunDirectory(args.run_dir)
-    det = AGIPD1M(run)
+    run_name = f'r{args.run:04d}'
+    logging.info('Opening proposal %d run %d', args.proposal, args.run)
+    run_proc = open_run(args.proposal, args.run, data="proc")
+    run_raw = open_run(args.proposal, args.run, data="raw")
+    det = AGIPD1M(run_proc)
 
     train_sel = parse_slice(args.trains)
     pulse_sel = parse_slice(args.pulses)
@@ -216,16 +255,20 @@ def main():
     logging.info('Selected %d trains', total_trains)
 
     if args.hits_only and args.cxi is None:
-        run_name = os.path.basename(args.run_dir.rstrip('/'))
-        exp_base = os.path.dirname(os.path.dirname(args.run_dir.rstrip('/')))
-        args.cxi = os.path.join(exp_base, 'usr', 'Shared', 'cxi', run_name + '.cxi')
-        logging.info('Deduced CXI path: %s', args.cxi)
+        try:
+            first_file = next(iter(run_raw.files)).filename
+            exp_base = os.path.dirname(os.path.dirname(os.path.dirname(first_file)))
+            args.cxi = os.path.join(exp_base, 'usr', 'Shared', 'cxi', run_name + '.cxi')
+            logging.info('Deduced CXI path: %s', args.cxi)
+        except Exception:
+            logging.error('Could not deduce CXI path automatically; use --cxi')
+            sys.exit(1)
 
     hit_train_ids = None
     if args.hits_only:
         sys.stderr.write('Loading hit flags...\n')
         sys.stderr.flush()
-        hit_train_ids, hit_pulse_ids, total_pulses, total_hit_pulses, hit_scores = load_hit_indices(run, train_sel)
+        hit_train_ids, hit_pulse_ids, total_pulses, total_hit_pulses, hit_scores = load_hit_indices(run_proc, train_sel)
         if hit_train_ids is None:
             logging.error('Hitfinder source not found; cannot use --hits-only')
             sys.exit(1)
@@ -251,7 +294,6 @@ def main():
 
     ext = os.path.splitext(args.output)[1].lower()
     use_hdf5 = ext != '.emc'
-    emcwriter = writeemc.EMCWriter(args.output, num_pix, hdf5=use_hdf5)
 
     print('Number of workers: %d' % args.num_workers)
     total_frames = 0
@@ -283,26 +325,58 @@ def main():
                         hit_scores = hit_scores[valid]
                 hit_indices = np.array(hit_indices)
                 data = h5['/entry_1/instrument_1/detector_1/data'][hit_indices]
+            pump_flags = compute_pump_flags(run_raw, hit_train_ids, hit_pulse_ids, args.ndark, args.pulse_offset)
             # data: (n_hits, 16, 512, 128)
             flat = data.reshape(len(hit_indices), NUM_PIX).astype('int32')
             np.clip(flat, 0, None, out=flat)
             if pix_sel is not None:
                 flat = flat[:, pix_sel]
             sparse = list(pool.map(_sparsify, flat))
-            for po, pm, cm in sparse:
-                emcwriter.write_sparse_frame(po, pm, cm)
+            stem, ext_out = os.path.splitext(args.output)
+            pumped_mask = pump_flags.astype(bool) if pump_flags is not None else None
+            if pumped_mask is not None:
+                pumped_out = stem + '_pumped' + ext_out
+                dark_out   = stem + '_dark'   + ext_out
+                logging.info('Splitting output: pumped -> %s, dark -> %s', pumped_out, dark_out)
+                # Create, write, finish each writer sequentially to avoid PID-based
+                # temp file name collision when two EMCWriters share the same output dir.
+                writer_pumped = writeemc.EMCWriter(pumped_out, num_pix, hdf5=use_hdf5)
+                for i, (po, pm, cm) in enumerate(sparse):
+                    if pumped_mask[i]:
+                        writer_pumped.write_sparse_frame(po, pm, cm)
+                writer_pumped.finish_write()
+                writer_dark = writeemc.EMCWriter(dark_out, num_pix, hdf5=use_hdf5)
+                for i, (po, pm, cm) in enumerate(sparse):
+                    if not pumped_mask[i]:
+                        writer_dark.write_sparse_frame(po, pm, cm)
+                writer_dark.finish_write()
+            else:
+                writer = writeemc.EMCWriter(args.output, num_pix, hdf5=use_hdf5)
+                for po, pm, cm in sparse:
+                    writer.write_sparse_frame(po, pm, cm)
+                writer.finish_write()
             total_frames = len(hit_indices)
-            run_name = os.path.basename(args.run_dir.rstrip('/'))
             out_dir = os.path.dirname(os.path.abspath(args.output))
-            score_fname = os.path.join(out_dir, f'{run_name}_hitscore.h5')
-            with h5py.File(score_fname, 'w') as f:
-                if hit_scores is not None:
-                    f.create_dataset('hitscore', data=hit_scores)
-                f.create_dataset('train_id', data=hit_train_ids.astype(np.uint64))
-                f.create_dataset('pulse_id', data=hit_pulse_ids.astype(np.uint64))
-            logging.info('Saved hit info (%d entries) to %s', len(hit_train_ids), score_fname)
+            if pumped_mask is not None:
+                for mask, suffix in [(pumped_mask, '_pumped'), (~pumped_mask, '_dark')]:
+                    fname = os.path.join(out_dir, f'{run_name}{suffix}_hitscore.h5')
+                    with h5py.File(fname, 'w') as f:
+                        if hit_scores is not None:
+                            f.create_dataset('hitscore', data=hit_scores[mask])
+                        f.create_dataset('train_id', data=hit_train_ids[mask].astype(np.uint64))
+                        f.create_dataset('pulse_id', data=hit_pulse_ids[mask].astype(np.uint64))
+                    logging.info('Saved hit info (%d entries) to %s', mask.sum(), fname)
+            else:
+                fname = os.path.join(out_dir, f'{run_name}_hitscore.h5')
+                with h5py.File(fname, 'w') as f:
+                    if hit_scores is not None:
+                        f.create_dataset('hitscore', data=hit_scores)
+                    f.create_dataset('train_id', data=hit_train_ids.astype(np.uint64))
+                    f.create_dataset('pulse_id', data=hit_pulse_ids.astype(np.uint64))
+                logging.info('Saved hit info (%d entries) to %s', len(hit_train_ids), fname)
         else:
             # No hit map: chunk through all trains
+            emcwriter = writeemc.EMCWriter(args.output, num_pix, hdf5=use_hdf5)
             all_train_ids = det.train_ids
             chunk_size = args.chunk_size
             n_chunks = (total_trains + chunk_size - 1) // chunk_size
@@ -321,9 +395,9 @@ def main():
                 pulse_ids = arr.coords['pulse'].values
                 total_frames += process_loaded(
                     data, train_ids, pulse_ids, None, pix_sel, emcwriter, pool)
+            emcwriter.finish_write()
 
     sys.stderr.write('Frames written: %d\n' % total_frames)
-    emcwriter.finish_write()
     elapsed = time.time() - t_start
     fps = total_frames / elapsed if elapsed > 0 else 0.0
     logging.info('Done. Total frames written: %d', total_frames)
