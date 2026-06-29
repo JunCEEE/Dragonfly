@@ -107,6 +107,8 @@ def parse_args():
     parser.add_argument('--pulse-offset', type=int, default=4,
                         help='Pulse ID offset applied to hit pulse IDs before matching '
                              'against BUNCHPATTERN laser pulse IDs (default: 4)')
+    parser.add_argument('--min-hitscore', type=float, default=None,
+                        help='Only write frames with hitscore >= this value (requires hitscore in hitfinder source)')
     parser.add_argument('-v', '--verbose', action='store_true', default=False)
     return parser.parse_args()
 
@@ -157,7 +159,13 @@ def load_hit_indices(run, train_sel):
 
 
 def compute_pump_flags(run, hit_train_ids, hit_pulse_ids, ndark, pulse_offset=4):
-    """Return uint8 array (1=pumped, 0=dark) for each hit, or None if unavailable."""
+    """Return uint8 array per hit: 1=pumped, 2=dark1, 3=dark2, … or None if unavailable.
+
+    For each train the bunch pattern gives sorted pump pulse IDs. The pattern repeats
+    as pump → dark1 → … → dark_ndark → pump → …, so consecutive pump IDs differ by
+    (ndark+1)*intra_step. intra_step is read directly from the first consecutive pump
+    pair in each train; dark pulse IDs follow as pump_id + d*intra_step (d=1…ndark).
+    """
     try:
         selected = run.select(BUNCHPATTERN_SRC).select_trains(by_id(hit_train_ids))
         bunch_pulse = selected.get_array(BUNCHPATTERN_SRC, BUNCHPATTERN_PULSEID_KEY)
@@ -167,22 +175,47 @@ def compute_pump_flags(run, hit_train_ids, hit_pulse_ids, ndark, pulse_offset=4)
         logging.warning('BUNCHPATTERN source not available; skipping pump flags')
         return None
 
-    # Build per-train set of laser pulse IDs (nonzero entries)
     corrected_pids = hit_pulse_ids - pulse_offset
-    laser_pulses = {}
+
+    # Build per-train sorted pump list
+    laser_sorted = {}
     for i, tid in enumerate(bp_train_ids):
-        nonzero = bp_values[i][bp_values[i] > 0]
-        if len(nonzero):
-            laser_pulses[int(tid)] = set(nonzero.astype(int))
+        # The value > 1 is valid pump pulse ID; 0/1 are unused
+        nonzero = sorted(int(p) for p in bp_values[i][bp_values[i] > 1])
+        if nonzero:
+            laser_sorted[int(tid)] = nonzero
 
+    # Per-train: derive intra_step from first consecutive pump pair, build dark sets
+    laser_sets = {}                          # tid -> set of pump pulse IDs
+    dark_sets  = [{} for _ in range(ndark)]  # d -> tid -> set of dark-(d+1) pulse IDs
+    for tid, pumps in laser_sorted.items():
+        laser_sets[tid] = set(pumps)
+        if len(pumps) < 2:
+            continue  # cannot derive dark IDs without at least 2 pump pulses
+        intra_step = (pumps[1] - pumps[0]) // (ndark + 1)
+        for d in range(ndark):
+            dark_sets[d][tid] = set(p + (d + 1) * intra_step for p in pumps)
+
+    # Label each hit by set-membership lookup
     flags = np.zeros(len(hit_train_ids), dtype=np.uint8)
+    n_unclassified = 0
     for k, (tid, pid) in enumerate(zip(hit_train_ids, corrected_pids)):
-        pids = laser_pulses.get(int(tid))
-        if pids is not None and int(pid) in pids:
+        tid = int(tid); pid = int(pid)
+        if pid in laser_sets.get(tid, set()):
             flags[k] = 1
+        else:
+            for d in range(ndark):
+                if pid in dark_sets[d].get(tid, set()):
+                    flags[k] = 2 + d  # dark1=2, dark2=3, ...
+                    break
+            else:
+                n_unclassified += 1
 
-    n_pumped = int(flags.sum())
+    n_pumped = int((flags == 1).sum())
     logging.info('Pump flags: %d/%d hits pumped', n_pumped, len(flags))
+    if n_unclassified:
+        logging.warning('%d/%d hits could not be classified (pulse ID not in pump or dark sets)',
+                        n_unclassified, len(flags))
     return flags
 
 
@@ -278,6 +311,16 @@ def main():
             % (total_hit_pulses, total_pulses, hit_rate))
         sys.stderr.flush()
 
+        if args.min_hitscore is not None:
+            if hit_scores is None:
+                logging.error('--min-hitscore requires hitscore data, but it is not available in the hitfinder source')
+                sys.exit(1)
+            score_mask = hit_scores >= args.min_hitscore
+            hit_train_ids = hit_train_ids[score_mask]
+            hit_pulse_ids = hit_pulse_ids[score_mask]
+            hit_scores = hit_scores[score_mask]
+            logging.info('min-hitscore=%.1f: %d/%d hits pass', args.min_hitscore, int(score_mask.sum()), len(score_mask))
+
     pix_sel = None
     num_pix = NUM_PIX
     if args.centerrad is not None:
@@ -333,23 +376,26 @@ def main():
                 flat = flat[:, pix_sel]
             sparse = list(pool.map(_sparsify, flat))
             stem, ext_out = os.path.splitext(args.output)
-            pumped_mask = pump_flags.astype(bool) if pump_flags is not None else None
-            if pumped_mask is not None:
-                pumped_out = stem + '_pumped' + ext_out
-                dark_out   = stem + '_dark'   + ext_out
-                logging.info('Splitting output: pumped -> %s, dark -> %s', pumped_out, dark_out)
+            if pump_flags is not None:
+                def flag_label(v):
+                    if v == 1:
+                        return 'pumped'
+                    if args.ndark == 1:
+                        return 'dark'
+                    return f'dark{v - 1}'
+
+                unique_flags = [v for v in range(1, args.ndark + 2)
+                                if np.any(pump_flags == v)]
                 # Create, write, finish each writer sequentially to avoid PID-based
                 # temp file name collision when two EMCWriters share the same output dir.
-                writer_pumped = writeemc.EMCWriter(pumped_out, num_pix, hdf5=use_hdf5)
-                for i, (po, pm, cm) in enumerate(sparse):
-                    if pumped_mask[i]:
-                        writer_pumped.write_sparse_frame(po, pm, cm)
-                writer_pumped.finish_write()
-                writer_dark = writeemc.EMCWriter(dark_out, num_pix, hdf5=use_hdf5)
-                for i, (po, pm, cm) in enumerate(sparse):
-                    if not pumped_mask[i]:
-                        writer_dark.write_sparse_frame(po, pm, cm)
-                writer_dark.finish_write()
+                for v in unique_flags:
+                    out_path = stem + f'_{flag_label(v)}' + ext_out
+                    logging.info('Output for %s -> %s', flag_label(v), out_path)
+                    w = writeemc.EMCWriter(out_path, num_pix, hdf5=use_hdf5)
+                    for i, (po, pm, cm) in enumerate(sparse):
+                        if pump_flags[i] == v:
+                            w.write_sparse_frame(po, pm, cm)
+                    w.finish_write()
             else:
                 writer = writeemc.EMCWriter(args.output, num_pix, hdf5=use_hdf5)
                 for po, pm, cm in sparse:
@@ -357,15 +403,17 @@ def main():
                 writer.finish_write()
             total_frames = len(hit_indices)
             out_dir = os.path.dirname(os.path.abspath(args.output))
-            if pumped_mask is not None:
-                for mask, suffix in [(pumped_mask, '_pumped'), (~pumped_mask, '_dark')]:
-                    fname = os.path.join(out_dir, f'{run_name}{suffix}_hitscore.h5')
+            if pump_flags is not None:
+                for v in unique_flags:
+                    mask = pump_flags == v
+                    label = flag_label(v)
+                    fname = os.path.join(out_dir, f'{run_name}_{label}_hitscore.h5')
                     with h5py.File(fname, 'w') as f:
                         if hit_scores is not None:
                             f.create_dataset('hitscore', data=hit_scores[mask])
                         f.create_dataset('train_id', data=hit_train_ids[mask].astype(np.uint64))
                         f.create_dataset('pulse_id', data=hit_pulse_ids[mask].astype(np.uint64))
-                    logging.info('Saved hit info (%d entries) to %s', mask.sum(), fname)
+                    logging.info('Saved hit info (%d entries) to %s', int(mask.sum()), fname)
             else:
                 fname = os.path.join(out_dir, f'{run_name}_hitscore.h5')
                 with h5py.File(fname, 'w') as f:
